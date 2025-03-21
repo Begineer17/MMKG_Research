@@ -15,11 +15,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-@dataclass
 class ModelArgs:
-    dim: int = 
-    n_layers: int = 32
-    n_heads: int = 8
+    dim: int 
+    n_layers: int = 8
+    n_heads: int = 5
     n_kv_heads: Optional[int] = None
     vocab_size: int = -1
     norm_eps: float = 1e-5
@@ -30,7 +29,7 @@ class ModelArgs:
     head_dim: int = -1
     q_rank: int = 12
     rank: int = 2
-    using_groupnorm: bool = True
+    using_groupnorm: bool = False
 
 class T6GroupNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6, elementwise_affine=True, memory_efficient=False):
@@ -275,7 +274,8 @@ class MEncoderLayer(nn.Module):
         # attn_weights_text = F.softmax(attn_scores_text, dim=-1)
         # attn_out_text = torch.matmul(attn_weights_text, V_text)
 
-        attn_out_text = (TPA(self.config).to(self.device))(text_in, text_in, text_in)
+        # attn_out_text = (TPA(self.config).to(self.device))(text_in, text_in, text_in)
+        attn_out_text, _ = nn.MultiheadAttention(self.config.dim, num_heads=self.config.n_heads).to(self.device)(text_in, text_in, text_in)
 
         # attn_out_text, _ = (nn.MultiheadAttention(self.hidden_dim, num_heads=self.num_heads).to(self.device))(Q_text, K_text, V_text)
 
@@ -300,7 +300,8 @@ class MEncoderLayer(nn.Module):
         # attn_weights_visl = F.softmax(attn_scores_visl, dim=-1)
         # attn_out_visl = torch.matmul(attn_weights_visl, (V_visl2+V_text2))
 
-        attn_out_visl = (TPA(self.config).to(self.device))(visl_in, visl_in + text_in, visl_in + text_in)
+        # attn_out_visl = (TPA(self.config).to(self.device))(visl_in, visl_in + text_in, visl_in + text_in)
+        attn_out_visl, _ = nn.MultiheadAttention(self.config.dim, num_heads=self.config.n_heads).to(self.device)(visl_in, visl_in + text_in, visl_in + text_in)
 
         # attn_out_visl, _ = (nn.MultiheadAttention(self.hidden_dim, num_heads=self.num_heads).to(self.device))(Q_visl, (K_visl2 + K_text2), (V_visl2 + V_text2))
 
@@ -343,7 +344,7 @@ class MEncoder(nn.Module):
         self.config = config
         self.layers = nn.ModuleList([
             MEncoderLayer(config).to(device)
-            for _ in range(config['num_layers'])
+            for _ in range(config.n_layers)
         ])
 
     def forward(self, text_in, visl_in):
@@ -544,23 +545,8 @@ class KBCModel(nn.Module, ABC):
         # lhs_visl = img_embeddings[x[:, 0]]
         # fused_text, fused_visl = self.m_encoder(lhs_ling, lhs_visl)
 
-        class ModelArgs:
-            dim: int = self.hidden_dim
-            n_layers: int = 32
-            n_heads: int = 8
-            n_kv_heads: Optional[int] = None
-            vocab_size: int = -1
-            norm_eps: float = 1e-5
-            rope_theta: float = 500000
-
-            max_batch_size: int = 32
-            max_seq_len: int = 2048
-            head_dim: int = -1
-            q_rank: int = 12
-            rank: int = 2
-            using_groupnorm: bool = False
-
         args = ModelArgs()
+        args.dim = self.rank
 
         # config = {
         #     'rank': 4, 'q_rank': 12, 'num_heads': 8, 'hidden_dim': self.rank, 
@@ -575,51 +561,55 @@ class KBCModel(nn.Module, ABC):
         # import sys
         # sys.exit()
 
-        mats_fused = nn.Parameter(torch.Tensor(self.rank, 4 * self.rank), requires_grad=True).to(device)
-        nn.init.xavier_uniform_(mats_fused)
+        # mats_fused = nn.Parameter(torch.Tensor(self.rank, 4 * self.rank), requires_grad=True).to(device)
+        # nn.init.xavier_uniform_(mats_fused)
 
-        fused_embeddings = fused_embeddings.to(device).mm(mats_fused.to(device))   
+        # fused_embeddings = fused_embeddings.to(device).mm(mats_fused.to(device))   
 
         embedding = (self.embeddings[0].weight.to(device) * self.alpha + fused_embeddings * self.gamma) * self.scale
+
+        # embedding = fused_embeddings * self.scale
 
         lhs = embedding[x[:, 0]]
         rel = self.embeddings[1](x[:, 1])
         rhs = embedding[x[:, 2]]
         # rhs = embedding
 
-        lhs_transformed = self.mobius_transform(lhs, x[:, 1])
+        # lhs_transformed = self.mobius_transform(lhs, x[:, 1])
 
         # Project entity embeddings into quaternion space
-        lhs_quat = (lhs_transformed[:, :self.rank],
-                    lhs_transformed[:, self.rank:2*self.rank],
-                    lhs_transformed[:, 2*self.rank:3*self.rank],
-                    lhs_transformed[:, 3*self.rank:])
-        rhs_quat = (rhs[:, :self.rank],
-                    rhs[:, self.rank:2*self.rank],
-                    rhs[:, 2*self.rank:3*self.rank],
-                    rhs[:, 3*self.rank:])
-        rel_quat = (rel[:, :self.rank],
-                    rel[:, self.rank:2*self.rank],
-                    rel[:, 2*self.rank:3*self.rank],
-                    rel[:, 3*self.rank:])
+        # lhs_quat = (lhs_transformed[:, :self.rank],
+        #             lhs_transformed[:, self.rank:2*self.rank],
+        #             lhs_transformed[:, 2*self.rank:3*self.rank],
+        #             lhs_transformed[:, 3*self.rank:])
+        # rhs_quat = (rhs[:, :self.rank],
+        #             rhs[:, self.rank:2*self.rank],
+        #             rhs[:, 2*self.rank:3*self.rank],
+        #             rhs[:, 3*self.rank:])
+        # rel_quat = (rel[:, :self.rank],
+        #             rel[:, self.rank:2*self.rank],
+        #             rel[:, 2*self.rank:3*self.rank],
+        #             rel[:, 3*self.rank:])
         
         # --- AFFINE TRANSFORMATION IN QUATERNION SPACE ---
         # Apply the learnable affine transformation to the quaternion embeddings.
-        lhs_quat = self.quat_affine(lhs_quat, x[:,1])
+        # lhs_quat = self.quat_affine(lhs_quat, x[:,1])
         # rhs_quat = self.quat_affine(rhs_quat, x[:,1])
         # ----------------------------------------------------
 
         # Compute the score (using the Hamilton product and inner product) against all entity embeddings
-        to_score = self.embeddings[0].weight
-        to_score = (to_score[:, :self.rank],
-                    to_score[:, self.rank:2*self.rank],
-                    to_score[:, 2*self.rank:3*self.rank],
-                    to_score[:, 3*self.rank:])
-        score = self._calc(lhs_quat, rel_quat, to_score)
+        # to_score = self.embeddings[0].weight
+        # to_score = (to_score[:, :self.rank],
+        #             to_score[:, self.rank:2*self.rank],
+        #             to_score[:, 2*self.rank:3*self.rank],
+        #             to_score[:, 3*self.rank:])
+        # score = self._calc(lhs_quat, rel_quat, to_score)
 
-        factors = (torch.sqrt(lhs_quat[0] ** 2 + lhs_quat[1] ** 2 + lhs_quat[2] ** 2 + lhs_quat[3] ** 2),
-                   torch.sqrt(rel_quat[0] ** 2 + rel_quat[1] ** 2 + rel_quat[2] ** 2 + rel_quat[3] ** 2),
-                   torch.sqrt(rhs_quat[0] ** 2 + rhs_quat[1] ** 2 + rhs_quat[2] ** 2 + rhs_quat[3] ** 2))
+        # factors = (torch.sqrt(lhs_quat[0] ** 2 + lhs_quat[1] ** 2 + lhs_quat[2] ** 2 + lhs_quat[3] ** 2),
+        #            torch.sqrt(rel_quat[0] ** 2 + rel_quat[1] ** 2 + rel_quat[2] ** 2 + rel_quat[3] ** 2),
+        #            torch.sqrt(rhs_quat[0] ** 2 + rhs_quat[1] ** 2 + rhs_quat[2] ** 2 + rhs_quat[3] ** 2))
+        score = lhs + rel 
+        factors = (torch.sqrt(lhs ** 2), torch.sqrt(rel ** 2), torch.sqrt(rhs ** 2))
         return score, factors
 
 class model_wn(KBCModel):
@@ -733,7 +723,7 @@ class model_db(KBCModel):
         # nn.init.xavier_uniform_(self.mats_ling)
         
         self.embeddings = nn.ModuleList([
-            nn.Embedding(s, 4 * rank, sparse=True) for s in sizes[:2]
+            nn.Embedding(s, rank, sparse=True) for s in sizes[:2]
         ])
 
         self.embeddings[0].weight.data *= init_size
@@ -742,14 +732,14 @@ class model_db(KBCModel):
         # self.embeddings1[1].weight.data *= init_size
 
         # Instead of directly learning A, we learn B and set A = exp(B) to guarantee invertibility.
-        self.affine_B = nn.Parameter(torch.zeros(num_relations, 4, 4))  # Unconstrained parameter
-        # t is a learnable translation (of shape [4, rank]) applied to each quaternion component.
-        self.affine_t = nn.Parameter(torch.zeros(num_relations, 4, rank))
+        # self.affine_B = nn.Parameter(torch.zeros(num_relations, 4, 4))  # Unconstrained parameter
+        # # t is a learnable translation (of shape [4, rank]) applied to each quaternion component.
+        # self.affine_t = nn.Parameter(torch.zeros(num_relations, 4, rank))
 
-        self.mobius_a = nn.Parameter(torch.randn(num_relations, 4, rank))
-        self.mobius_b = nn.Parameter(torch.randn(num_relations, 4, rank))
-        self.mobius_c = nn.Parameter(torch.randn(num_relations, 4, rank))
-        self.mobius_d = nn.Parameter(torch.randn(num_relations, 4, rank))
+        # self.mobius_a = nn.Parameter(torch.randn(num_relations, 4, rank))
+        # self.mobius_b = nn.Parameter(torch.randn(num_relations, 4, rank))
+        # self.mobius_c = nn.Parameter(torch.randn(num_relations, 4, rank))
+        # self.mobius_d = nn.Parameter(torch.randn(num_relations, 4, rank))
 
 #mkgw
 
@@ -812,7 +802,7 @@ class model_mkgw(KBCModel):
 
     
         self.embeddings = nn.ModuleList([
-            nn.Embedding(s, 4 * rank, sparse=True) for s in sizes[:2]
+            nn.Embedding(s, rank, sparse=True) for s in sizes[:2]
         ])
 
         self.embeddings[0].weight.data *= init_size
@@ -821,14 +811,14 @@ class model_mkgw(KBCModel):
         # self.embeddings1[1].weight.data *= init_size    
 
         # Instead of directly learning A, we learn B and set A = exp(B) to guarantee invertibility.
-        self.affine_B = nn.Parameter(torch.zeros(num_relations, 4, 4))  # Unconstrained parameter
-        # t is a learnable translation (of shape [4, rank]) applied to each quaternion component.
-        self.affine_t = nn.Parameter(torch.zeros(num_relations, 4, rank))
+        # self.affine_B = nn.Parameter(torch.zeros(num_relations, 4, 4))  # Unconstrained parameter
+        # # t is a learnable translation (of shape [4, rank]) applied to each quaternion component.
+        # self.affine_t = nn.Parameter(torch.zeros(num_relations, 4, rank))
 
-        self.mobius_a = nn.Parameter(torch.randn(num_relations, 4, rank))
-        self.mobius_b = nn.Parameter(torch.randn(num_relations, 4, rank))
-        self.mobius_c = nn.Parameter(torch.randn(num_relations, 4, rank))
-        self.mobius_d = nn.Parameter(torch.randn(num_relations, 4, rank))
+        # self.mobius_a = nn.Parameter(torch.randn(num_relations, 4, rank))
+        # self.mobius_b = nn.Parameter(torch.randn(num_relations, 4, rank))
+        # self.mobius_c = nn.Parameter(torch.randn(num_relations, 4, rank))
+        # self.mobius_d = nn.Parameter(torch.randn(num_relations, 4, rank))
     
 class model_mkgy(KBCModel):
     def __init__(self, sizes: Tuple[int, int, int], rank: int, init_size: float = 1e-3, num_relations = 2000):
@@ -865,7 +855,7 @@ class model_mkgy(KBCModel):
         # nn.init.xavier_uniform_(self.mats_ling)
     
         self.embeddings = nn.ModuleList([
-            nn.Embedding(s, 4 * rank, sparse=True) for s in sizes[:2]
+            nn.Embedding(s, rank, sparse=True) for s in sizes[:2]
         ])
 
         
@@ -875,11 +865,11 @@ class model_mkgy(KBCModel):
         # self.embeddings1[1].weight.data *= init_size
 
         # Instead of directly learning A, we learn B and set A = exp(B) to guarantee invertibility.
-        self.affine_B = nn.Parameter(torch.zeros(num_relations, 4, 4))  # Unconstrained parameter
-        # t is a learnable translation (of shape [4, rank]) applied to each quaternion component.
-        self.affine_t = nn.Parameter(torch.zeros(num_relations, 4, rank))
+        # self.affine_B = nn.Parameter(torch.zeros(num_relations, 4, 4))  # Unconstrained parameter
+        # # t is a learnable translation (of shape [4, rank]) applied to each quaternion component.
+        # self.affine_t = nn.Parameter(torch.zeros(num_relations, 4, rank))
 
-        self.mobius_a = nn.Parameter(torch.randn(num_relations, 4, rank))
-        self.mobius_b = nn.Parameter(torch.randn(num_relations, 4, rank))
-        self.mobius_c = nn.Parameter(torch.randn(num_relations, 4, rank))
-        self.mobius_d = nn.Parameter(torch.randn(num_relations, 4, rank))
+        # self.mobius_a = nn.Parameter(torch.randn(num_relations, 4, rank))
+        # self.mobius_b = nn.Parameter(torch.randn(num_relations, 4, rank))
+        # self.mobius_c = nn.Parameter(torch.randn(num_relations, 4, rank))
+        # self.mobius_d = nn.Parameter(torch.randn(num_relations, 4, rank))
