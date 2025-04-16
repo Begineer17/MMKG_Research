@@ -15,346 +15,43 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class ModelArgs:
-    dim: int 
-    n_layers: int = 8
-    n_heads: int = 5
-    n_kv_heads: Optional[int] = None
-    vocab_size: int = -1
-    norm_eps: float = 1e-5
-    rope_theta: float = 500000
+from efficient_kan import KAN
 
-    max_batch_size: int = 32
-    max_seq_len: int = 2048
-    head_dim: int = -1
-    q_rank: int = 12
-    rank: int = 2
-    using_groupnorm: bool = False
-
-class T6GroupNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6, elementwise_affine=True, memory_efficient=False):
-        super().__init__()
-        self.dim = dim
-        self.eps = eps
-        self.elementwise_affine = elementwise_affine
-        if self.elementwise_affine:
-            self.weight = nn.Parameter(torch.ones(dim))
-        else:
-            self.register_parameter('weight', None)
-
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
-    def forward(self, x):
-        output = self._norm(x.float()).type_as(x)
-        if self.weight is not None:
-            output = output * self.weight
-        return output
-
-    def extra_repr(self) -> str:
-        return f'dim={self.dim}, eps={self.eps}, elementwise_affine={self.elementwise_affine}'
-
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device, dtype=torch.float32)
-    freqs = torch.outer(t, freqs)
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
-    return freqs_cis
-
-
-def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
-    ndim = x.ndim
-    assert 0 <= 1 < ndim
-    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
-    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
-    return freqs_cis.view(*shape)
-
-
-def apply_rotary_emb(
-    xq: torch.Tensor,
-    xk: torch.Tensor,
-    freqs_cis: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
-    return xq_out.type_as(xq), xk_out.type_as(xk)
-
-class TPA(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
-
-        self.n_heads = args.n_heads
-        self.head_dim = args.head_dim if args.head_dim > 0 else args.dim // args.n_heads
-        # maybe different from args.dim // args.n_heads
-
-        self.n_head = args.n_heads
-        self.q_rank = args.q_rank
-        self.rank = args.rank
-        self.dim = args.dim
-        
-        self.using_groupnorm = args.using_groupnorm
-        
-        self.W_A_q = nn.Linear(args.dim, self.n_head * self.q_rank, bias=False)
-        self.W_A_k = nn.Linear(args.dim, self.n_head * self.rank, bias=False)
-        self.W_A_v = nn.Linear(args.dim, self.n_head * self.rank, bias=False)
-
-        # Define B projection parameters for Q, K, V
-        self.W_B_q = nn.Linear(args.dim, self.q_rank * self.head_dim, bias=False)
-        self.W_B_k = nn.Linear(args.dim, self.rank * self.head_dim, bias=False)
-        self.W_B_v = nn.Linear(args.dim, self.rank * self.head_dim, bias=False)
-        
-        self.cache_kA = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_heads, self.rank,)).cuda()
-        self.cache_vA = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_heads, self.rank,)).cuda()
-        self.cache_kB = torch.zeros((args.max_batch_size, args.max_seq_len, self.rank, self.head_dim,)).cuda()
-        self.cache_vB = torch.zeros((args.max_batch_size, args.max_seq_len, self.rank, self.head_dim,)).cuda()
-        
-        self.reset_parameters()
-
-        if self.using_groupnorm:
-            self.subln = T6GroupNorm(self.head_dim, eps=1e-5, elementwise_affine=True)
-    def reset_parameters(self, args):
-        W_A_q_tensor = self.W_A_q.weight.view(self.dim, self.n_head, self.q_rank)
-        W_A_k_tensor = self.W_A_k.weight.view(self.dim, self.n_head, self.rank)
-        W_A_v_tensor = self.W_A_v.weight.view(self.dim, self.n_head, self.rank)
-        nn.init.xavier_uniform_(W_A_q_tensor)
-        nn.init.xavier_uniform_(W_A_k_tensor)
-        nn.init.xavier_uniform_(W_A_v_tensor)
-        self.W_A_q.weight.data = W_A_q_tensor.view_as(self.W_A_q.weight)
-        self.W_A_k.weight.data = W_A_k_tensor.view_as(self.W_A_k.weight)
-        self.W_A_v.weight.data = W_A_v_tensor.view_as(self.W_A_v.weight)
-
-        W_B_q_tensor = self.W_B_q.weight.view(self.dim, self.q_rank, self.head_dim)
-        W_B_k_tensor = self.W_B_k.weight.view(self.dim, self.rank, self.head_dim)
-        W_B_v_tensor = self.W_B_v.weight.view(self.dim, self.rank, self.head_dim)
-        nn.init.xavier_uniform_(W_B_q_tensor)
-        nn.init.xavier_uniform_(W_B_k_tensor)
-        nn.init.xavier_uniform_(W_B_v_tensor)
-        self.W_B_q.weight.data = W_B_q_tensor.view_as(self.W_B_q.weight)
-        self.W_B_k.weight.data = W_B_k_tensor.view_as(self.W_B_k.weight)
-        self.W_B_v.weight.data = W_B_v_tensor.view_as(self.W_B_v.weight)
-        
-    def forward(
-        self,
-        Q: torch.Tensor,
-        K: torch.Tensor,
-        V: torch.Tensor,
-        start_pos: int,
-        freqs_cis: torch.Tensor,
-        mask: Optional[torch.Tensor],
-    ):
-        bsz, seqlen, _ = Q.shape
-
-        A_q = self.W_A_q(Q).view(bsz, seqlen, self.n_head, self.q_rank)
-        A_k = self.W_A_k(K).view(bsz, seqlen, self.n_head, self.rank)
-        A_v = self.W_A_v(V).view(bsz, seqlen, self.n_head, self.rank)
-
-        # Compute intermediate variables B for Q, K, and V
-        B_q = self.W_B_q(Q).view(bsz, seqlen, self.q_rank, self.head_dim)
-        B_k = self.W_B_k(K).view(bsz, seqlen, self.rank, self.head_dim)
-        B_v = self.W_B_v(V).view(bsz, seqlen, self.rank, self.head_dim)
-
-        B_q, B_k = apply_rotary_emb(B_q, B_k, freqs_cis=freqs_cis)
-        
-        # Cache A_k, A_v
-        self.cache_kA = self.cache_kA.to(A_k)
-        self.cache_vA = self.cache_vA.to(A_v)
-        
-        self.cache_kA[:bsz, start_pos : start_pos + seqlen] = A_k
-        self.cache_vA[:bsz, start_pos : start_pos + seqlen] = A_v
-        
-        A_k = self.cache_kA[:bsz, : start_pos + seqlen]
-        A_v = self.cache_vA[:bsz, : start_pos + seqlen]
-        
-        # Cache B_k, B_v
-        
-        self.cache_kB = self.cache_kB.to(B_k)
-        self.cache_vB = self.cache_vB.to(B_v)
-        
-        self.cache_kB[:bsz, start_pos : start_pos + seqlen] = B_k
-        self.cache_vB[:bsz, start_pos : start_pos + seqlen] = B_v
-        
-        B_k = self.cache_kB[:bsz, : start_pos + seqlen]
-        B_v = self.cache_vB[:bsz, : start_pos + seqlen]
-        
-        # Reshape A_q, A_k, A_v
-        A_q = A_q.view(bsz * seqlen, self.n_head, self.q_rank)
-        A_k = A_k.view(bsz * seqlen, self.n_head, self.rank)
-        A_v = A_v.view(bsz * seqlen, self.n_head, self.rank)
-
-        # Reshape B_k, B_v  
-        B_q = B_q.view(bsz * seqlen, self.q_rank, self.head_dim)
-        B_k = B_k.view(bsz * seqlen, self.rank, self.head_dim)
-        B_v = B_v.view(bsz * seqlen, self.rank, self.head_dim)
-        
-        q = torch.bmm(A_q, B_q).div_(self.q_rank).view(bsz, seqlen, self.n_head, self.head_dim)
-        k = torch.bmm(A_k, B_k).div_(self.rank).view(bsz, seqlen, self.n_head, self.head_dim)
-        v = torch.bmm(A_v, B_v).div_(self.rank).view(bsz, seqlen, self.n_head, self.head_dim)
-        
-        k = k.transpose(1, 2) 
-        scores = torch.matmul(q.transpose(1, 2), k.transpose(2, 3)) / math.sqrt(self.head_dim)
-        if mask is not None:
-            scores = scores + mask  
-        scores = F.softmax(scores.float(), dim=-1).type_as(q)
-        output = torch.matmul(scores, v.transpose(1, 2))  
-        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
-        return self.wo(output)
-
-class MEncoderLayer(nn.Module):
-    """
-    A single M-Encoder layer that:
-      1) Does Prefix-Guided Interaction in the multi-head attention.
-      2) Uses the modified FFN(xt) = ReLU( xt W1 + Agg(xv) W3 + b1 ) W2 + b2
-         for Correlation-Aware Fusion.
-    """
-    def __init__(self, args):
-        super(MEncoderLayer, self).__init__()
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.device = device
-
-        self.config = args
-        
-        # # ---- Multi-head attention for text side ----
-        # self.text_q_proj = nn.Linear(config['hidden_dim'], config['hidden_dim']).to(device)
-        # self.text_k_proj = nn.Linear(config['hidden_dim'], config['hidden_dim']).to(device)
-        # self.text_v_proj = nn.Linear(config['hidden_dim'], config['hidden_dim']).to(device)
-
-        # # ---- Multi-head attention for visual side ----
-        # self.visl_q_proj = nn.Linear(config['hidden_dim'], config['hidden_dim']).to(device)
-        # self.visl_k_proj = nn.Linear(config['hidden_dim'], config['hidden_dim']).to(device)
-        # self.visl_v_proj = nn.Linear(config['hidden_dim'], config['hidden_dim']).to(device)
-
-        # ---- Feed-Forward weights for text side, using the "modified" formula
-        # W1: (hidden_dim, 4*hidden_dim),  W2: (4*hidden_dim, hidden_dim)
-        self.W1 = nn.Linear(args.dim, 4 * args.dim, bias=False).to(device)   # for xt
-        self.W3 = nn.Linear(args.dim, 4 * args.dim, bias=False).to(device)   # for Agg(xv)
-        self.b1 = nn.Parameter(torch.zeros(4 * args.dim)).to(device)
-        self.W2 = nn.Linear(4 * args.dim, args.dim, bias=False).to(device)
-        self.b2 = nn.Parameter(torch.zeros(args.dim)).to(device)
-
-        # If you want to do the same on the visual side, define parallel layers for W1, W3, etc.
-        # Or keep it one-sided, depending on the paper’s approach.
-
-        # ---- LayerNorms
-        self.text_attn_ln = nn.LayerNorm(args.dim).to(device)
-        self.text_ffn_ln  = nn.LayerNorm(args.dim).to(device)
-        self.visl_attn_ln = nn.LayerNorm(args.dim).to(device)
-        self.visl_ffn_ln  = nn.LayerNorm(args.dim).to(device)
-
-        # Scaling factor in attention
-        self.scale_factor = (args.dim // args.n_heads) ** -0.5
-
-    def forward(self, text_in, visl_in):
+class GatedFusion(nn.Module):
+    def __init__(self, embed_dim):
         """
-        text_in: (batch_size, T, hidden_dim)
-        visl_in: (batch_size, V, hidden_dim)
-        returns: (text_out, visl_out)
+        Initialize the gating mechanism.
+        
+        Args:
+            embed_dim (int): The dimension of each embedding.
         """
-        # -----------------------------------------------------------
-        # 1) Prefix-Guided Interaction for text side
-        #    text queries from text, keys+values from [text; visual].
-        # -----------------------------------------------------------
-        # Q_text = self.text_q_proj(text_in)
-        # K_text = self.text_k_proj(text_in)
-        # V_text = self.text_v_proj(text_in)
-
-        # K_visl = self.visl_k_proj(visl_in)
-        # V_visl = self.visl_v_proj(visl_in)
-
-        ## K_cat_text = torch.cat([K_text, K_visl], dim=1)  # (B, T+V, H)
-        ## V_cat_text = torch.cat([V_text, V_visl], dim=1)  # (B, T+V, H)
-
-        # K_text = K_text + K_visl
-        # V_text = V_text + V_visl
-
-        # attn_scores_text = torch.matmul(Q_text, K_text.transpose(-2, -1)) * self.scale_factor
-        # attn_weights_text = F.softmax(attn_scores_text, dim=-1)
-        # attn_out_text = torch.matmul(attn_weights_text, V_text)
-
-        # attn_out_text = (TPA(self.config).to(self.device))(text_in, text_in, text_in)
-        attn_out_text, _ = nn.MultiheadAttention(self.config.dim, num_heads=self.config.n_heads).to(self.device)(text_in, text_in, text_in)
-
-        # attn_out_text, _ = (nn.MultiheadAttention(self.hidden_dim, num_heads=self.num_heads).to(self.device))(Q_text, K_text, V_text)
-
-        # attn_out_text = self.text_out_proj(attn_out_text) 
-        text_attn_res = self.text_attn_ln(text_in + attn_out_text)  # residual
-
-        # -----------------------------------------------------------
-        # 2) Prefix-Guided Interaction for visual side
-        #    visual queries from visual, keys+values from [visual; text].
-        # -----------------------------------------------------------
-        # Q_visl = self.visl_q_proj(visl_in)
-        # K_visl2 = self.visl_k_proj(visl_in)
-        # V_visl2 = self.visl_v_proj(visl_in)
-
-        # K_text2 = self.text_k_proj(text_in)
-        # V_text2 = self.text_v_proj(text_in)
-
-        # K_cat_visl = torch.cat([K_visl2, K_text2], dim=1)
-        # V_cat_visl = torch.cat([V_visl2, V_text2], dim=1)
-
-        # attn_scores_visl = torch.matmul(Q_visl, (K_visl2+K_text2).transpose(-2, -1)) * self.scale_factor
-        # attn_weights_visl = F.softmax(attn_scores_visl, dim=-1)
-        # attn_out_visl = torch.matmul(attn_weights_visl, (V_visl2+V_text2))
-
-        # attn_out_visl = (TPA(self.config).to(self.device))(visl_in, visl_in + text_in, visl_in + text_in)
-        attn_out_visl, _ = nn.MultiheadAttention(self.config.dim, num_heads=self.config.n_heads).to(self.device)(visl_in, visl_in + text_in, visl_in + text_in)
-
-        # attn_out_visl, _ = (nn.MultiheadAttention(self.hidden_dim, num_heads=self.num_heads).to(self.device))(Q_visl, (K_visl2 + K_text2), (V_visl2 + V_text2))
-
-        # attn_out_visl = self.visl_out_proj(attn_out_visl)
-        visl_attn_res = self.visl_attn_ln(visl_in + attn_out_visl)
-
-        # -----------------------------------------------------------
-        # 3) Correlation-Aware Fusion (CAF) in the FFN of text side,
-        #    using the modified feed-forward formula:
-        #      FFN(x_t) = ReLU( x_t W1 + Agg(x_v) W3 + b1 ) W2 + b2
-        # -----------------------------------------------------------
-        # (A) Compute token-wise similarity => (B,T,V)
-        S = torch.matmul(text_attn_res, visl_attn_res.transpose(-2, -1))
-        weights_for_fusion = F.softmax(S, dim=-1)  # sum over V dimension
-        # (B) Weighted sum of visual tokens => shape (B,T,H)
-        agg_visl = torch.matmul(weights_for_fusion, visl_attn_res)
-
-        # (C) Feed-Forward with your custom formula
-        # x_t => x_t W1,  agg(x_v) => agg_visl W3, plus biases
-        xtW1      = self.W1(text_attn_res)        # (B,T,4H)
-        xvW3      = self.W3(agg_visl)             # (B,T,4H)
-        ff_input  = xtW1 + xvW3 + self.b1         # (B,T,4H)
-        ff_hidden = F.relu(ff_input)             # ReLU
-        ff_output = self.W2(ff_hidden) + self.b2  # (B,T,H)
-
-        text_ffn_res = self.text_ffn_ln(text_attn_res + ff_output)  # final text
-
-        # If you wish, do a parallel feed-forward for the visual side as well
-        # or simply keep visl_attn_res if not needed.
-
-        return text_ffn_res, visl_attn_res
-
-class MEncoder(nn.Module):
-    """
-    Stacks multiple MEncoderLayer layers to fuse text + visual embeddings.
-    """
-    def __init__(self, config):
-        super(MEncoder, self).__init__()
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.config = config
-        self.layers = nn.ModuleList([
-            MEncoderLayer(config).to(device)
-            for _ in range(config.n_layers)
-        ])
-
-    def forward(self, text_in, visl_in):
-        # text_in: (batch_size, T, hidden_dim)
-        # visl_in: (batch_size, V, hidden_dim)
-        text_in = text_in.unsqueeze(1)
-        visl_in = visl_in.unsqueeze(1)
-        for layer in self.layers:
-            text_in, visl_in = layer(text_in, visl_in)
-        return text_in, visl_in
+        super(GatedFusion, self).__init__()
+        # A linear transformation to compute the gate.
+        # We concatenate the two embeddings, so input dimension is 2 * embed_dim,
+        # and we produce an output of size embed_dim.
+        self.gate_fc = KAN([2 * embed_dim, embed_dim])
+        self.sigmoid = nn.Sigmoid()
+    
+    def forward(self, embedding1, embedding2):
+        """
+        Forward pass to compute the fused embedding.
+        
+        Args:
+            embedding1 (torch.Tensor): Tensor of shape (batch_size, embed_dim)
+            embedding2 (torch.Tensor): Tensor of shape (batch_size, embed_dim)
+        
+        Returns:
+            torch.Tensor: Fused embedding of shape (batch_size, embed_dim)
+        """
+        # Concatenate embeddings along the feature dimension
+        combined = torch.cat([embedding1, embedding2], dim=1)
+        
+        # Compute the gate vector using the linear layer followed by sigmoid activation
+        gate = self.sigmoid(self.gate_fc(combined))
+        
+        # Fuse the embeddings
+        fused_embedding = gate * embedding1 + (1 - gate) * embedding2
+        return fused_embedding
 
 class KBCModel(nn.Module, ABC):
     def get_ranking(
@@ -541,34 +238,27 @@ class KBCModel(nn.Module, ABC):
         img_embeddings = self.img_vec.to(device).mm(mats_img.to(device))
         ling_embeddings = self.ling_vec.to(device).mm(mats_ling.to(device))
 
+        fft_img = torch.fft.fft(img_embeddings, dim=1)
+        fft_ling = torch.fft.fft(ling_embeddings, dim=1)
+
+        img_embeddings = torch.real(torch.fft.ifft(fft_img, dim=1))
+        ling_embeddings = torch.real(torch.fft.ifft(fft_ling, dim=1))
+
         # lhs_ling = ling_embeddings[x[:, 0]]
         # lhs_visl = img_embeddings[x[:, 0]]
         # fused_text, fused_visl = self.m_encoder(lhs_ling, lhs_visl)
-
-        args = ModelArgs()
-        args.dim = self.rank
-
-        # config = {
-        #     'rank': 4, 'q_rank': 12, 'num_heads': 8, 'hidden_dim': self.rank, 
-        #     'num_layers': 4
-        # }
-
-        m_encoder = MEncoder(args)
-        fused_text, fused_visl = m_encoder(ling_embeddings, img_embeddings)
         
-        fused_embeddings = fused_text.squeeze(1) # => final fused vector for the head
+        fused_embeddings = GatedFusion(self.rank)(img_embeddings, ling_embeddings)
         # print(fused_embeddings.shape)
         # import sys
         # sys.exit()
 
-        # mats_fused = nn.Parameter(torch.Tensor(self.rank, 4 * self.rank), requires_grad=True).to(device)
-        # nn.init.xavier_uniform_(mats_fused)
+        mats_fused = nn.Parameter(torch.Tensor(self.rank, 4 * self.rank), requires_grad=True).to(device)
+        nn.init.xavier_uniform_(mats_fused)
 
-        # fused_embeddings = fused_embeddings.to(device).mm(mats_fused.to(device))   
+        fused_embeddings = fused_embeddings.to(device).mm(mats_fused.to(device))   
 
         embedding = (self.embeddings[0].weight.to(device) * self.alpha + fused_embeddings * self.gamma) * self.scale
-
-        # embedding = fused_embeddings * self.scale
 
         lhs = embedding[x[:, 0]]
         rel = self.embeddings[1](x[:, 1])
@@ -578,18 +268,18 @@ class KBCModel(nn.Module, ABC):
         # lhs_transformed = self.mobius_transform(lhs, x[:, 1])
 
         # Project entity embeddings into quaternion space
-        # lhs_quat = (lhs_transformed[:, :self.rank],
-        #             lhs_transformed[:, self.rank:2*self.rank],
-        #             lhs_transformed[:, 2*self.rank:3*self.rank],
-        #             lhs_transformed[:, 3*self.rank:])
-        # rhs_quat = (rhs[:, :self.rank],
-        #             rhs[:, self.rank:2*self.rank],
-        #             rhs[:, 2*self.rank:3*self.rank],
-        #             rhs[:, 3*self.rank:])
-        # rel_quat = (rel[:, :self.rank],
-        #             rel[:, self.rank:2*self.rank],
-        #             rel[:, 2*self.rank:3*self.rank],
-        #             rel[:, 3*self.rank:])
+        lhs_quat = (lhs[:, :self.rank],
+                    lhs[:, self.rank:2*self.rank],
+                    lhs[:, 2*self.rank:3*self.rank],
+                    lhs[:, 3*self.rank:])
+        rhs_quat = (rhs[:, :self.rank],
+                    rhs[:, self.rank:2*self.rank],
+                    rhs[:, 2*self.rank:3*self.rank],
+                    rhs[:, 3*self.rank:])
+        rel_quat = (rel[:, :self.rank],
+                    rel[:, self.rank:2*self.rank],
+                    rel[:, 2*self.rank:3*self.rank],
+                    rel[:, 3*self.rank:])
         
         # --- AFFINE TRANSFORMATION IN QUATERNION SPACE ---
         # Apply the learnable affine transformation to the quaternion embeddings.
@@ -598,19 +288,35 @@ class KBCModel(nn.Module, ABC):
         # ----------------------------------------------------
 
         # Compute the score (using the Hamilton product and inner product) against all entity embeddings
-        # to_score = self.embeddings[0].weight
-        # to_score = (to_score[:, :self.rank],
-        #             to_score[:, self.rank:2*self.rank],
-        #             to_score[:, 2*self.rank:3*self.rank],
-        #             to_score[:, 3*self.rank:])
-        # score = self._calc(lhs_quat, rel_quat, to_score)
+        to_score = self.embeddings[0].weight
+        to_score = (to_score[:, :self.rank],
+                    to_score[:, self.rank:2*self.rank],
+                    to_score[:, 2*self.rank:3*self.rank],
+                    to_score[:, 3*self.rank:])
+        score = self._calc(lhs_quat, rel_quat, to_score)
 
-        # factors = (torch.sqrt(lhs_quat[0] ** 2 + lhs_quat[1] ** 2 + lhs_quat[2] ** 2 + lhs_quat[3] ** 2),
-        #            torch.sqrt(rel_quat[0] ** 2 + rel_quat[1] ** 2 + rel_quat[2] ** 2 + rel_quat[3] ** 2),
-        #            torch.sqrt(rhs_quat[0] ** 2 + rhs_quat[1] ** 2 + rhs_quat[2] ** 2 + rhs_quat[3] ** 2))
-        score = lhs + rel 
-        factors = (torch.sqrt(lhs ** 2), torch.sqrt(rel ** 2), torch.sqrt(rhs ** 2))
-        return score, factors
+        factor = (torch.sqrt(lhs_quat[0] ** 2 + lhs_quat[1] ** 2 + lhs_quat[2] ** 2 + lhs_quat[3] ** 2),
+                   torch.sqrt(rel_quat[0] ** 2 + rel_quat[1] ** 2 + rel_quat[2] ** 2 + rel_quat[3] ** 2),
+                   torch.sqrt(rhs_quat[0] ** 2 + rhs_quat[1] ** 2 + rhs_quat[2] ** 2 + rhs_quat[3] ** 2))
+        
+        # complex
+        # lhs = lhs[:, :self.rank], lhs[:, self.rank:]
+        # rel = rel[:, :self.rank], rel[:, self.rank:]
+        # rhs = rhs[:, :self.rank], rhs[:, self.rank:]
+
+        # to_score = self.embeddings[0].weight
+        # to_score = to_score[:, :self.rank], to_score[:, self.rank:]  
+              
+        # score = ( (lhs[0] * rel[0] - lhs[1] * rel[1]) @ to_score[0].transpose(0, 1) 
+        #         + (lhs[0] * rel[1] + lhs[1] * rel[0]) @ to_score[1].transpose(0, 1))  # (h, r, t) 
+
+        # factor = ( 
+        #     torch.sqrt(lhs[0] ** 2 + lhs[1] ** 2),
+        #     torch.sqrt(rel[0] ** 2 + rel[1] ** 2),
+        #     torch.sqrt(rhs[0] ** 2 + rhs[1] ** 2),   
+        # )
+
+        return score, factor
 
 class model_wn(KBCModel):
     def __init__(self, sizes: Tuple[int, int, int], rank: int, init_size: float = 1e-3):
@@ -723,7 +429,7 @@ class model_db(KBCModel):
         # nn.init.xavier_uniform_(self.mats_ling)
         
         self.embeddings = nn.ModuleList([
-            nn.Embedding(s, rank, sparse=True) for s in sizes[:2]
+            nn.Embedding(s, 4 * rank, sparse=True) for s in sizes[:2]
         ])
 
         self.embeddings[0].weight.data *= init_size
@@ -802,7 +508,7 @@ class model_mkgw(KBCModel):
 
     
         self.embeddings = nn.ModuleList([
-            nn.Embedding(s, rank, sparse=True) for s in sizes[:2]
+            nn.Embedding(s, 4 * rank, sparse=True) for s in sizes[:2]
         ])
 
         self.embeddings[0].weight.data *= init_size
@@ -855,7 +561,7 @@ class model_mkgy(KBCModel):
         # nn.init.xavier_uniform_(self.mats_ling)
     
         self.embeddings = nn.ModuleList([
-            nn.Embedding(s, rank, sparse=True) for s in sizes[:2]
+            nn.Embedding(s, 4 * rank, sparse=True) for s in sizes[:2]
         ])
 
         
