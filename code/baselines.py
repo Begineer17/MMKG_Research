@@ -6,7 +6,7 @@ from torch import nn
 import numpy as np
 from tqdm import tqdm
 import torch.nn.functional as F
-from models_2 import KBCModel
+from models import KBCModel
 
 
 
