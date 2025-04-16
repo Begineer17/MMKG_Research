@@ -4,7 +4,7 @@ import os
 
 import numpy as np
 import torch
-from models_2 import KBCModel
+from models import KBCModel
 
 class Dataset(object):
     def __init__(self, data_path: str, name: str):
